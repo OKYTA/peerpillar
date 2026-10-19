@@ -1,0 +1,1 @@
+export async function GET(){return Response.json({ready:Boolean(process.env.GOOGLE_CLIENT_ID&&process.env.GOOGLE_CLIENT_SECRET&&process.env.SESSION_SECRET&&process.env.APP_URL)},{headers:{'Cache-Control':'no-store'}})}

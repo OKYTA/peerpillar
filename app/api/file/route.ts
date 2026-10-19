@@ -1,0 +1,4 @@
+import {getDemoUser} from '../../../lib/session';
+import {get,readJson,filePath,fileMetaPath} from '../../../lib/storage';
+export const runtime='nodejs';
+export async function GET(req:Request){const u=await getDemoUser();if(!u)return new Response('Unauthorized',{status:401});const id=new URL(req.url).searchParams.get('id')||'';if(!/^[a-f0-9-]{36}$/.test(id))return new Response('Not found',{status:404});const meta=await readJson<{name:string;mime:string}>(fileMetaPath(u.userId,id));if(!meta)return new Response('Not found',{status:404});const file=await get(filePath(u.userId,id),{access:'private'});if(!file||file.statusCode!==200)return new Response('Not found',{status:404});return new Response(file.stream,{headers:{'Content-Type':meta.value.mime,'Content-Disposition':`inline; filename*=UTF-8''${encodeURIComponent(meta.value.name)}`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'}})}
