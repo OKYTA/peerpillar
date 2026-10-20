@@ -5,6 +5,7 @@ export async function readJson<T>(path:string):Promise<{value:T;etag:string}|nul
 export async function writeJson(path:string,value:unknown,etag?:string){
  try{await put(path,JSON.stringify(value),{access:'private',contentType:'application/json',addRandomSuffix:false,allowOverwrite:!!etag,...(etag?{ifMatch:etag}:{})});return true;}catch(e){if(e instanceof BlobPreconditionFailedError||e instanceof Error&&e.name==='BlobAlreadyExistsError')return false;throw e}
 }
+export const sharedPath='shared.json';
 export const workspacePath=(id:string)=>`workspaces/${id}.json`;
 export const fileMetaPath=(user:string,id:string)=>`metadata/${user}/${id}.json`;
 export const filePath=(user:string,id:string)=>`files/${user}/${id}`;
