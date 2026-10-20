@@ -12,6 +12,14 @@ This is a prepared source update. It has NOT been deployed. Production access re
 - OAuth authorization code flow with PKCE and a short-lived signed state cookie. Google verifies the email. Signed, expiring HttpOnly sessions use the persistent account identity.
 - Email delivery adapter for plan saves, booking confirmations/cancellations and submission receipts. Delivery failures remain visible in the workspace. No email was sent during development.
 
+## Data model
+
+- `workspaces/{userId}.json` holds only personal data: profile, roadmap progress, tasks and saved opportunities.
+- `shared.json` holds everything two accounts must see together: mentor profiles and availability, bookings, reviews, support requests and each user's notifications. Writes use the Blob etag and retry, so simultaneous bookings do not overwrite each other. It is a single document: move it to a database before it grows past a few hundred records.
+- Mentors list themselves from the Mentor desk. There are no built-in sample mentors, so Find a mentor stays empty until a mentor creates a profile.
+- Attachments stay under their uploader's folder. `/api/file` serves them to the owner and to the student/mentor of the review they are attached to; Admins never receive learner work.
+- `npm test` runs an end-to-end Student / Mentor / Admin flow against the route handlers with Blob and cookies mocked in memory (no network, no extra dependencies).
+
 ## Required production configuration
 
 Set these in the existing PeerPillar Vercel project's server-side environment settings:

@@ -1,24 +1,42 @@
 import {sendUpdate} from '../../../lib/email';
-import {getDemoUser as getChatGPTUser} from '../../../lib/session';
-import {readJson,writeJson,workspacePath,fileMetaPath} from '../../../lib/storage';
-import {emptyWorkspace,normalizeWorkspace,PLATFORM_RATE,mentors,opportunities,type Workspace} from '../../data';
+import {getDemoUser,type Account} from '../../../lib/session';
+import {readJson,writeJson,workspacePath,sharedPath,fileMetaPath} from '../../../lib/storage';
+import {emptyWorkspace,emptyShared,normalizeWorkspace,PLATFORM_RATE,opportunities,tracks,type Workspace,type Shared,type Mentor} from '../../data';
 export const dynamic='force-dynamic';
 const reply=(v:unknown,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store'}});
-export async function GET(){try{const u=await getChatGPTUser();if(!u)return reply({error:'Unable to open workspace.'},401);const row=await readJson<{data:Workspace;version:number}>(workspacePath(u.userId));return reply({data:normalizeWorkspace(row?.value.data??emptyWorkspace),user:{name:u.fullName,email:u.email,role:u.role}});}catch{return reply({error:'Workspace storage is temporarily unavailable. Please try again.'},503)}}
+type Doc<T>={data:T;version:number};
+const COLORS=['#e9e3da','#e2e8dd','#e6def0','#dfe9ee','#eee3db','#dfe4f1'];
+// Personal actions touch only the caller's own workspace; every other action edits the shared document.
+const PERSONAL=['profile','save','task','toggleTask','deleteTask','check'];
+// shortcut: one shared.json document, so every shared write rereads/rewrites it; move to a real database once it outgrows a few hundred records.
+function snapshot(u:Account,s:Workspace,sh:Shared){
+ const mine=(x:{studentId?:string;mentorId:string})=>u.role==='Admin'||x.studentId===u.userId||x.mentorId===u.userId;
+ const mentors:Mentor[]=Object.values(sh.mentors).map(m=>({...m,busy:sh.bookings.filter(b=>b.mentorId===m.id&&b.status!=='Cancelled').map(b=>b.date+'T'+b.time)}));
+ // Admin sees activity for the stats but never a learner's work.
+ const review=(r:Shared['reviews'][number])=>u.role==='Admin'?{...r,text:'',notes:[],feedback:undefined,score:undefined,file:undefined,audio:undefined}:r;
+ return {data:{...s,bookings:sh.bookings.filter(mine),reviews:sh.reviews.filter(mine).map(review),notifications:sh.inbox[u.userId]??[],complaints:sh.complaints.filter(c=>u.role==='Admin'||c.userId===u.userId),availability:sh.mentors[u.userId]?.availability??[]} as Workspace,mentors};
+}
+export async function GET(){try{const u=await getDemoUser();if(!u)return reply({error:'Unable to open workspace.'},401);const [row,shared]=await Promise.all([readJson<Doc<Workspace>>(workspacePath(u.userId)),readJson<Doc<Shared>>(sharedPath)]);return reply({...snapshot(u,normalizeWorkspace({...emptyWorkspace,...row?.value.data}),shared?.value.data??emptyShared),user:{id:u.userId,name:u.fullName,email:u.email,role:u.role}});}catch{return reply({error:'Workspace storage is temporarily unavailable. Please try again.'},503)}}
 export async function POST(req:Request){
- const u=await getChatGPTUser();if(!u)return reply({error:'Please sign in.'},401);
+ const u=await getDemoUser();if(!u)return reply({error:'Please sign in.'},401);
  if(req.headers.get('origin')&&new URL(req.headers.get('origin')!).host!==new URL(req.url).host)return reply({error:'Invalid origin.'},403);
  try{
  const raw=await req.text();if(raw.length>200000)return reply({error:'Request too large.'},413);const b=JSON.parse(raw);
- const staff=['complete','link','reviewStatus','note','deleteNote','feedback','audio','availability'];
- if(staff.includes(b.action)&&!['Mentor','Admin'].includes(u.role))return reply({error:'Mentor access required.'},403);
+ const staff=['mentorProfile','complete','link','reviewStatus','note','deleteNote','feedback','audio','availability'];
+ if(staff.includes(b.action)&&u.role!=='Mentor')return reply({error:'Mentor access required.'},403);
  if(b.action==='resolve'&&u.role!=='Admin')return reply({error:'Admin access required.'},403);
  if(['book','review','rate'].includes(b.action)&&u.role!=='Student')return reply({error:'Student access required.'},403);
- const row=await readJson<{data:Workspace;version:number}>(workspacePath(u.userId));const version=row?.value.version??0;
- const s:Workspace=normalizeWorkspace(row?.value.data??structuredClone(emptyWorkspace));
- const id=()=>crypto.randomUUID();const notify=(text:string)=>s.notifications.unshift({id:id(),text,read:false});
+ const personal=PERSONAL.includes(b.action);
+ const id=()=>crypto.randomUUID();
  const str=(v:unknown,max=1000)=>typeof v==='string'?v.trim().slice(0,max):'';
  const validDate=(v:string)=>/^\d{4}-\d{2}-\d{2}$/.test(v)&&!Number.isNaN(Date.parse(v+'T12:00:00Z'));
+ // Shared writes race with other users, so reread and reapply on a lost etag instead of failing.
+ for(let attempt=0;attempt<4;attempt++){
+ const [prow,srow]=await Promise.all([readJson<Doc<Workspace>>(workspacePath(u.userId)),readJson<Doc<Shared>>(sharedPath)]);
+ const s:Workspace=normalizeWorkspace({...emptyWorkspace,...prow?.value.data});const sh:Shared=srow?.value.data??structuredClone(emptyShared);
+ const notify=(to:string,text:string)=>{sh.inbox[to]=[{id:id(),text,read:false},...(sh.inbox[to]??[])].slice(0,100)};
+ const mentorReview=()=>{const r=sh.reviews.find(x=>x.id===b.id&&x.mentorId===u.userId);if(!r)throw Error('Review not found.');return r};
+ const mentorBooking=()=>{const x=sh.bookings.find(x=>x.id===b.id&&x.mentorId===u.userId);if(!x)throw Error('Session not found.');return x};
  switch(b.action){
  case 'profile':{
  const p=b.profile;if(!p||!str(p.name,60)||!['8','9','10','11','12','Gap year','Undergraduate','Other'].includes(p.grade)||!['IELTS','SAT','University Admissions','International Programs'].includes(p.track)||!validDate(p.date)||new Date(p.date+'T23:59:59Z').getTime()<Date.now()||!Number.isInteger(p.hours)||p.hours<1||p.hours>30)throw Error('Please check your name, grade, goal date and study hours.');
@@ -29,39 +47,48 @@ export async function POST(req:Request){
  const list=(v:unknown)=>Array.isArray(v)?v.filter((x:unknown)=>typeof x==='string').slice(0,15).map((x:string)=>str(x,100)):[];
  if(JSON.stringify(s.profile?.tracks||[s.profile?.track])!==JSON.stringify(selected))s.checked=[];
  s.profile={tracks:selected as string[],purposes:list(p.purposes),stages:list(p.stages),goals:list(p.goals),scores,name:str(p.name,60),grade:p.grade,track:p.track,current:str(p.current,100),target:str(p.target,100),purpose:str(p.purpose,300),date:p.date,hours:p.hours};break;}
+ case 'mentorProfile':{
+ const p=b.profile,price=Number(p?.price);
+ if(!p||!tracks.includes(p.track)||!str(p.headline,120)||!str(p.bio,600)||!Number.isInteger(price)||price<5||price>200)throw Error('Check your track, headline, bio and a price between $5 and $200.');
+ const focus=(Array.isArray(p.focus)?p.focus:[]).filter((x:unknown)=>typeof x==='string').map((x:string)=>str(x,40)).filter(Boolean).slice(0,5);
+ sh.mentors[u.userId]={id:u.userId,name:u.fullName,initials:u.fullName.split(' ').map(x=>x[0]).slice(0,2).join('').toUpperCase(),color:COLORS[parseInt(u.userId.slice(0,2),16)%COLORS.length],track:p.track,country:str(p.country,60)||'Online',credential:str(p.credential,100),headline:str(p.headline,120),bio:str(p.bio,600),focus,price,availability:sh.mentors[u.userId]?.availability??emptyWorkspace.availability};break;}
  case 'book':{
- if(!mentors.some(m=>m.id===b.mentorId)||!validDate(b.date)||!s.availability.includes(b.time)||!str(b.topic))throw Error('Choose a mentor, an available time and a session topic.');
+ const m=sh.mentors[b.mentorId];
+ if(!m||!validDate(b.date)||!m.availability.includes(b.time)||!str(b.topic))throw Error('Choose a mentor, an available time and a session topic.');
  const when=new Date(b.date+'T'+b.time+':00+05:00');if(when.getTime()<Date.now()+3600000)throw Error('Please book at least one hour ahead.');
- if(s.bookings.some(x=>x.date===b.date&&x.time===b.time&&x.status!=='Cancelled'))throw Error('You already have a session at that time.');
- s.bookings.push({id:id(),mentorId:b.mentorId,date:b.date,time:b.time,topic:str(b.topic,500),price:mentors.find(m=>m.id===b.mentorId)!.price,platformRate:PLATFORM_RATE,status:'Confirmed'});notify('Session booked. Find it in My sessions. All times are Asia/Tashkent (UTC+5).');break;}
- case 'cancel':{const x=s.bookings.find(x=>x.id===b.id);if(!x||x.status!=='Confirmed')throw Error('Only upcoming sessions can be cancelled.');x.status='Cancelled';notify('Session cancelled. No demo payment was collected.');break;}
- case 'complete':{const x=s.bookings.find(x=>x.id===b.id);if(!x||x.status!=='Confirmed')throw Error('Session cannot be completed.');x.status='Completed';notify('Session completed. Leave a review when you are ready.');break;}
- case 'link':{const x=s.bookings.find(x=>x.id===b.id);const url=new URL(b.link);if(!x||url.protocol!=='https:')throw Error('Enter a secure https meeting link.');x.link=url.href;notify('Your mentor added the meeting link.');break;}
- case 'rate':{const x=s.bookings.find(x=>x.id===b.id);if(!x||x.status!=='Completed'||![1,2,3,4,5].includes(b.rating))throw Error('Complete a session before rating it.');x.rating=b.rating;x.comment=str(b.comment,500);break;}
+ if(sh.bookings.some(x=>x.date===b.date&&x.time===b.time&&x.status!=='Cancelled'&&(x.mentorId===m.id||x.studentId===u.userId)))throw Error('That time is no longer available.');
+ sh.bookings.push({id:id(),mentorId:m.id,studentId:u.userId,studentName:u.fullName,date:b.date,time:b.time,topic:str(b.topic,500),price:m.price,platformRate:PLATFORM_RATE,status:'Confirmed'});notify(u.userId,'Session booked. Find it in My sessions. All times are Asia/Tashkent (UTC+5).');notify(m.id,u.fullName+' booked a session on '+b.date+' at '+b.time+' (UTC+5).');break;}
+ case 'cancel':{const x=sh.bookings.find(x=>x.id===b.id&&(x.studentId===u.userId||x.mentorId===u.userId));if(!x||x.status!=='Confirmed')throw Error('Only upcoming sessions can be cancelled.');x.status='Cancelled';notify(u.userId,'Session cancelled. No demo payment was collected.');notify(u.userId===x.studentId?x.mentorId:x.studentId,'A session on '+x.date+' at '+x.time+' was cancelled.');break;}
+ case 'complete':{const x=mentorBooking();if(x.status!=='Confirmed')throw Error('Session cannot be completed.');x.status='Completed';notify(x.studentId,'Session completed. Leave a review when you are ready.');break;}
+ case 'link':{const x=mentorBooking();const url=new URL(b.link);if(url.protocol!=='https:')throw Error('Enter a secure https meeting link.');x.link=url.href;notify(x.studentId,'Your mentor added the meeting link.');break;}
+ case 'rate':{const x=sh.bookings.find(x=>x.id===b.id&&x.studentId===u.userId);if(!x||x.status!=='Completed'||![1,2,3,4,5].includes(b.rating))throw Error('Complete a session before rating it.');x.rating=b.rating;x.comment=str(b.comment,500);break;}
  case 'review':{
  if(!['IELTS','SAT','University Admissions','International Programs'].includes(b.track)||!str(b.title,120)||(!str(b.text,30000)&&!b.file))throw Error('Add a title and your draft or attachment.');
- if(!mentors.some(m=>m.id===b.mentorId&&m.track===b.track))throw Error('Select a mentor in this track.');
- if(b.file){if(!/^[a-f0-9-]{36}$/.test(b.file.id))throw Error('Invalid attachment.');const f=await readJson<{id:string;name:string;mime:string}>(fileMetaPath(u.userId,b.file.id));if(!f)throw Error('Attachment not found.');b.file={id:f.value.id,name:f.value.name};}
- s.reviews.unshift({id:id(),title:str(b.title,120),track:b.track,text:str(b.text,30000),file:b.file,status:'Submitted',mentorId:b.mentorId,notes:[]});notify('Your work was submitted. Track feedback in Review studio.');break;}
- case 'reviewStatus':{const r=s.reviews.find(x=>x.id===b.id);if(!r)throw Error('Review not found.');if(!['In review','Submitted'].includes(b.status))throw Error('Invalid status.');r.status=b.status;break;}
- case 'note':{const r=s.reviews.find(x=>x.id===b.id);if(!r||!str(b.text)||!['TR','CC','LR','GRA','Reasoning','Trap','Method','Voice','Structure','Reflection'].includes(b.category))throw Error('Add an annotation and category.');r.notes.push({id:id(),category:b.category,quote:str(b.quote,500),text:str(b.text,2000)});r.status='In review';break;}
- case 'deleteNote':{const r=s.reviews.find(x=>x.id===b.id);if(!r)throw Error('Review not found.');r.notes=r.notes.filter(x=>x.id!==b.noteId);break;}
- case 'feedback':{const r=s.reviews.find(x=>x.id===b.id);if(!r||!str(b.feedback))throw Error('Write feedback before sending it.');r.feedback=str(b.feedback,5000);r.score=str(b.score,60);r.status='Feedback ready';notify('Feedback ready: '+r.title);break;}
- case 'audio':{const r=s.reviews.find(x=>x.id===b.id);if(!r)throw Error('Review not found.');if(!/^[a-f0-9-]{36}$/.test(b.file?.id))throw Error('Invalid attachment.');const f=await readJson<{id:string;name:string;mime:string}>(fileMetaPath(u.userId,b.file.id));if(!f||!f.value.mime.startsWith('audio/'))throw Error('Audio attachment not found.');r.audio={id:f.value.id,name:f.value.name};break;}
+ if(sh.mentors[b.mentorId]?.track!==b.track)throw Error('Select a mentor in this track.');
+ if(b.file){if(!/^[a-f0-9-]{36}$/.test(b.file.id))throw Error('Invalid attachment.');const f=await readJson<{id:string;name:string;mime:string}>(fileMetaPath(u.userId,b.file.id));if(!f)throw Error('Attachment not found.');b.file={id:f.value.id,name:f.value.name,owner:u.userId};}
+ sh.reviews.unshift({id:id(),title:str(b.title,120),track:b.track,text:str(b.text,30000),file:b.file,status:'Submitted',mentorId:b.mentorId,studentId:u.userId,studentName:u.fullName,notes:[]});notify(u.userId,'Your work was submitted. Track feedback in Review studio.');notify(b.mentorId,u.fullName+' submitted “'+str(b.title,120)+'” for review.');break;}
+ case 'reviewStatus':{const r=mentorReview();if(!['In review','Submitted'].includes(b.status))throw Error('Invalid status.');r.status=b.status;break;}
+ case 'note':{const r=mentorReview();if(!str(b.text)||!['TR','CC','LR','GRA','Reasoning','Trap','Method','Voice','Structure','Reflection'].includes(b.category))throw Error('Add an annotation and category.');r.notes.push({id:id(),category:b.category,quote:str(b.quote,500),text:str(b.text,2000)});r.status='In review';break;}
+ case 'deleteNote':{const r=mentorReview();r.notes=r.notes.filter(x=>x.id!==b.noteId);break;}
+ case 'feedback':{const r=mentorReview();if(!str(b.feedback))throw Error('Write feedback before sending it.');r.feedback=str(b.feedback,5000);r.score=str(b.score,60);r.status='Feedback ready';notify(r.studentId,'Feedback ready: '+r.title);break;}
+ case 'audio':{const r=mentorReview();if(!/^[a-f0-9-]{36}$/.test(b.file?.id))throw Error('Invalid attachment.');const f=await readJson<{id:string;name:string;mime:string}>(fileMetaPath(u.userId,b.file.id));if(!f||!f.value.mime.startsWith('audio/'))throw Error('Audio attachment not found.');r.audio={id:f.value.id,name:f.value.name,owner:u.userId};notify(r.studentId,'Voice feedback added: '+r.title);break;}
  case 'save':{if(!opportunities.some(x=>x.id===b.id))throw Error('Opportunity not found.');s.saved=s.saved.includes(b.id)?s.saved.filter(x=>x!==b.id):[...s.saved,b.id];break;}
  case 'task':{if(!str(b.text,200)||!validDate(b.date))throw Error('Enter a task and valid date.');s.tasks.push({id:id(),text:str(b.text,200),date:b.date,done:false});break;}
  case 'toggleTask':{const x=s.tasks.find(x=>x.id===b.id);if(x)x.done=!x.done;break;}
  case 'deleteTask':s.tasks=s.tasks.filter(x=>x.id!==b.id);break;
  case 'check':{if(!s.profile||!/^\d+$/.test(b.id)||Number(b.id)>=((s.profile.tracks?.length||1)*4))throw Error('Unknown milestone.');s.checked=s.checked.includes(b.id)?s.checked.filter(x=>x!==b.id):[...s.checked,b.id];break;}
- case 'read':s.notifications.forEach(x=>x.read=true);break;
- case 'availability':{if(!Array.isArray(b.times)||!b.times.length||b.times.some((x:string)=>!/^([01]\d|2[0-3]):[0-5]\d$/.test(x)))throw Error('Choose at least one valid time.');s.availability=[...new Set(b.times)] as string[];break;}
- case 'complaint':if(!str(b.text))throw Error('Tell us what happened.');s.complaints.unshift({id:id(),text:str(b.text,2000),status:'Open'});break;
- case 'resolve':{const x=s.complaints.find(x=>x.id===b.id);if(x)x.status='Resolved';break;}
+ case 'read':(sh.inbox[u.userId]??[]).forEach(x=>x.read=true);break;
+ case 'availability':{const m=sh.mentors[u.userId];if(!m)throw Error('Create your mentor profile first.');if(!Array.isArray(b.times)||!b.times.length||b.times.some((x:string)=>!/^([01]\d|2[0-3]):[0-5]\d$/.test(x)))throw Error('Choose at least one valid time.');m.availability=[...new Set(b.times)] as string[];break;}
+ case 'complaint':if(!str(b.text))throw Error('Tell us what happened.');sh.complaints.unshift({id:id(),text:str(b.text,2000),status:'Open',userId:u.userId,from:u.fullName});break;
+ case 'resolve':{const x=sh.complaints.find(x=>x.id===b.id);if(x)x.status='Resolved';break;}
  default:throw Error('Unknown action.');
  }
- s.notifications=s.notifications.slice(0,100);
- if(!await writeJson(workspacePath(u.userId),{data:s,version:version+1},row?.etag))return reply({error:'Your workspace changed. Refresh and try again.'},409);
- let emailWarning:string|null=null;if(['book','cancel','review','profile'].includes(b.action)){const subject=({book:'Session booked',cancel:'Session cancelled',review:'Submission received',profile:'Your plan is ready'} as Record<string,string>)[b.action];emailWarning=await sendUpdate(u.email,'PeerPillar · '+subject,subject+'. Open '+(process.env.APP_URL||'https://peerpillar.vercel.app')+' to view your workspace.',u.userId+'-'+(version+1));}
- return reply({data:s,emailWarning});
+ const row=personal?prow:srow,version=row?.value.version??0;
+ const {profile,saved,tasks:todo,checked,verified}=s;
+ if(!await writeJson(personal?workspacePath(u.userId):sharedPath,{data:personal?{profile,saved,tasks:todo,checked,verified}:sh,version:version+1},row?.etag))continue;
+ let emailWarning:string|null=null;if(['book','cancel','review','profile'].includes(b.action)){const subject=({book:'Session booked',cancel:'Session cancelled',review:'Submission received',profile:'Your plan is ready'} as Record<string,string>)[b.action];emailWarning=await sendUpdate(u.email,'PeerPillar · '+subject,subject+'. Open '+(process.env.APP_URL||'https://peerpillar.vercel.app')+' to view your workspace.',u.userId+'-'+(personal?'p':'s')+(version+1));}
+ return reply({...snapshot(u,s,sh),emailWarning});
+ }
+ return reply({error:'Your workspace changed. Refresh and try again.'},409);
  }catch(e){return reply({error:e instanceof Error?e.message:'Unable to save. Please try again.'},400)}
 }
